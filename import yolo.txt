@@ -1,0 +1,392 @@
+# Project: ANPR (Automatic Number Plate Recognition)
+# Structured, modular Python project using YOLO (or fallback contour method) + EasyOCR
+# GUI: Tkinter preview + controls
+# Files included in this single document (separated by headers):
+
+"""
+project_tree/
+├─ modules/
+│  ├─ yolo_detector.py
+│  ├─ plate_finder.py
+│  └─ ocr_easyocr.py
+├─ app.py
+├─ requirements.txt
+└─ README.md
+"""
+
+# --------------------
+# file: modules/yolo_detector.py
+# --------------------
+"""
+YOLO detector module (uses OpenCV DNN).
+Place your YOLO .cfg and .weights (or .onnx) files in model/ and update paths.
+This module exposes a YOLODetector class with detect(frame) -> list of boxes.
+"""
+
+import cv2
+import numpy as np
+from typing import List, Tuple
+
+class YOLODetector:
+    def __init__(self, cfg_path: str, weights_path: str, names_path: str = None,
+                 use_cuda: bool = False, conf_threshold: float = 0.5, nms_threshold: float = 0.4,
+                 input_size: Tuple[int,int] = (416, 416)):
+        self.cfg = cfg_path
+        self.weights = weights_path
+        self.names = names_path
+        self.conf_threshold = conf_threshold
+        self.nms_threshold = nms_threshold
+        self.input_size = input_size
+
+        # load network
+        self.net = cv2.dnn.readNet(self.weights, self.cfg)
+        if use_cuda:
+            try:
+                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
+            except Exception:
+                # fallback to CPU
+                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        else:
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+        # load class names if provided
+        self.classes = None
+        if self.names is not None:
+            with open(self.names, 'r') as f:
+                self.classes = [l.strip() for l in f.readlines()]
+
+        # determine output layer names
+        layer_names = self.net.getLayerNames()
+        try:
+            self.output_layers = [layer_names[i[0] - 1] for i in self.net.getUnconnectedOutLayers()]
+        except Exception:
+            # OpenCV versions differ
+            self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
+
+    def detect(self, frame: np.ndarray) -> List[Tuple[int,int,int,int,float,int]]:
+        """Return list of detections as (x, y, w, h, conf, class_id)
+        Only detections with conf > conf_threshold are returned and after NMS.
+        """
+        H, W = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1/255.0, self.input_size, swapRB=True, crop=False)
+        self.net.setInput(blob)
+        outs = self.net.forward(self.output_layers)
+
+        boxes = []
+        confidences = []
+        class_ids = []
+
+        for out in outs:
+            for detection in out:
+                scores = detection[5:]
+                class_id = int(np.argmax(scores)) if len(scores)>0 else 0
+                conf = float(scores[class_id]) if len(scores)>0 else float(detection[4])
+                # some YOLO exports put objectness at index 4
+                if conf > self.conf_threshold:
+                    center_x = int(detection[0] * W)
+                    center_y = int(detection[1] * H)
+                    w = int(detection[2] * W)
+                    h = int(detection[3] * H)
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
+                    boxes.append([x, y, w, h])
+                    confidences.append(conf)
+                    class_ids.append(class_id)
+
+        # apply NMS
+        idxs = cv2.dnn.NMSBoxes(boxes, confidences, self.conf_threshold, self.nms_threshold)
+        detections = []
+        if len(idxs) > 0:
+            for i in idxs.flatten():
+                x, y, w, h = boxes[i]
+                detections.append((x, y, w, h, confidences[i], class_ids[i]))
+        return detections
+
+
+# --------------------
+# file: modules/plate_finder.py
+# --------------------
+"""
+Fallback plate finder using morphological ops & contour filtering (adapted from user's code).
+Exposes PlateFinderFallback class with find_plates(frame) -> list of plate images and boxes.
+"""
+
+import cv2
+import numpy as np
+from skimage import measure
+import imutils
+
+class PlateFinderFallback:
+    def __init__(self, min_area=4100, max_area=15000):
+        self.min_area = min_area
+        self.max_area = max_area
+        self.element_structure = cv2.getStructuringElement(cv2.MORPH_RECT, (22,3))
+
+    def preprocess(self, frame):
+        blur = cv2.GaussianBlur(frame, (7,7), 0)
+        gray = cv2.cvtColor(blur, cv2.COLOR_BGR2GRAY)
+        sobelx = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize=3)
+        _, th = cv2.threshold(sobelx, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        morph = cv2.morphologyEx(th, cv2.MORPH_CLOSE, self.element_structure)
+        return morph
+
+    def extract_plate_regions(self, frame):
+        processed = self.preprocess(frame)
+        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        plates = []
+        boxes = []
+        for c in contours:
+            rect = cv2.minAreaRect(c)
+            (x, y), (w, h), angle = rect
+            if w==0 or h==0:
+                continue
+            area = w*h
+            ratio = max(w/h, h/w)
+            if self.min_area < area < self.max_area and 2.5 < ratio < 7 and abs(angle) < 15:
+                x0, y0, w0, h0 = cv2.boundingRect(c)
+                plate_img = frame[y0:y0+h0, x0:x0+w0]
+                plates.append(plate_img)
+                boxes.append((x0, y0, w0, h0))
+        return plates, boxes
+
+# --------------------
+# file: modules/ocr_easyocr.py
+# --------------------
+"""
+OCR wrapper using EasyOCR. EasyOCR is robust and supports multiple languages.
+Install: pip install easyocr
+"""
+
+import easyocr
+from typing import List, Tuple
+import numpy as np
+
+class EasyOCROperator:
+    def __init__(self, langs=['en'], gpu=False):
+        # langs example: ['en'] or ['en','hi']
+        self.reader = easyocr.Reader(langs, gpu=gpu)
+
+    def read_plate(self, plate_img: np.ndarray) -> Tuple[str, List[dict]]:
+        # convert to RGB for easyocr
+        img_rgb = cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB)
+        # let easyocr detect and return text
+        results = self.reader.readtext(img_rgb, detail=1)
+        # results: list of (bbox, text, conf)
+        text = ''.join([r[1] for r in results]) if results else ''
+        return text, results
+
+# --------------------
+# file: app.py
+# --------------------
+"""
+Tkinter GUI application that shows video, allows toggling YOLO vs fallback, and displays detected plates + recognized text.
+"""
+
+import threading
+import time
+import cv2
+import numpy as np
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk
+
+# local imports
+from modules.yolo_detector import YOLODetector
+from modules.plate_finder import PlateFinderFallback
+from modules.ocr_easyocr import EasyOCROperator
+
+class ANPRApp:
+    def __init__(self, window):
+        self.window = window
+        self.window.title('ANPR - YOLO + EasyOCR')
+
+        # video source (default webcam)
+        self.video_source = 0
+        self.cap = None
+        self.running = False
+
+        # detectors
+        self.use_yolo = tk.BooleanVar(value=True)
+        # initialize placeholders (user must set paths)
+        self.yolo = None
+        self.fallback = PlateFinderFallback()
+        self.ocr = EasyOCROperator(langs=['en'], gpu=False)
+
+        # UI layout
+        self._build_ui()
+
+    def _build_ui(self):
+        frm = ttk.Frame(self.window)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        # top controls
+        ctrl = ttk.Frame(frm)
+        ctrl.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(ctrl, text='Open Video/File', command=self.open_file).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text='Start', command=self.start).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text='Stop', command=self.stop).pack(side=tk.LEFT)
+        ttk.Checkbutton(ctrl, text='Use YOLO', variable=self.use_yolo).pack(side=tk.LEFT)
+
+        ttk.Button(ctrl, text='Load YOLO Model', command=self.load_yolo).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text='Toggle GPU OCR', command=self.toggle_ocr_gpu).pack(side=tk.LEFT)
+
+        # canvas for video
+        self.canvas = tk.Canvas(frm, width=800, height=450)
+        self.canvas.pack()
+
+        # bottom text area
+        self.textbox = tk.Text(frm, height=8)
+        self.textbox.pack(fill=tk.X)
+
+    def open_file(self):
+        path = filedialog.askopenfilename(filetypes=[('Video', '*.mp4 *.avi *.mov'), ('All files','*.*')])
+        if path:
+            self.video_source = path
+            self.log(f'Opened {path}')
+
+    def load_yolo(self):
+        cfg = filedialog.askopenfilename(title='Select YOLO cfg', filetypes=[('cfg','*.cfg'),('all','*.*')])
+        if not cfg:
+            return
+        weights = filedialog.askopenfilename(title='Select YOLO weights', filetypes=[('weights','*.weights'),('onnx','*.onnx'),('all','*.*')])
+        if not weights:
+            return
+        names = filedialog.askopenfilename(title='Select class names txt (optional)', filetypes=[('txt','*.txt'),('all','*.*')])
+        self.yolo = YOLODetector(cfg, weights, names_path=names if names else None, use_cuda=False)
+        self.log('YOLO model loaded')
+
+    def toggle_ocr_gpu(self):
+        # reinitialize ocr with opposite GPU flag (requires easyocr GPU setup)
+        current_gpu = getattr(self.ocr.reader, 'gpu', False)
+        self.ocr = EasyOCROperator(langs=['en'], gpu=not current_gpu)
+        self.log(f'OCR GPU set to {not current_gpu}')
+
+    def start(self):
+        if self.running:
+            return
+        # open capture
+        self.cap = cv2.VideoCapture(self.video_source)
+        if not self.cap.isOpened():
+            messagebox.showerror('Error', 'Cannot open video source')
+            return
+        self.running = True
+        threading.Thread(target=self._update_loop, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        self.log('Stopped')
+
+    def _update_loop(self):
+        while self.running and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            display_frame = frame.copy()
+
+            detections = []
+            if self.use_yolo.get() and self.yolo is not None:
+                dets = self.yolo.detect(frame)
+                for (x,y,w,h,conf,cls) in dets:
+                    # optionally filter by class name if available
+                    detections.append((x,y,w,h,conf))
+            else:
+                plates, boxes = self.fallback.extract_plate_regions(frame)
+                for b in boxes:
+                    x,y,w,h = b
+                    detections.append((x,y,w,h,0.9))
+
+            # Draw and OCR
+            recognized = []
+            for (x,y,w,h,conf) in detections:
+                x1, y1 = max(0,x), max(0,y)
+                x2, y2 = x1+w, y1+h
+                cv2.rectangle(display_frame, (x1,y1), (x2,y2), (0,255,0), 2)
+                plate_crop = frame[y1:y2, x1:x2]
+                if plate_crop.size == 0:
+                    continue
+                text, details = self.ocr.read_plate(plate_crop)
+                recognized.append((text, (x1,y1,x2,y2), conf))
+                cv2.putText(display_frame, text, (x1, max(0,y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+
+            # update textbox
+            self.textbox.delete('1.0', tk.END)
+            for txt, box, conf in recognized:
+                self.textbox.insert(tk.END, f'{txt}  box={box}  conf={conf:.2f}\n')
+
+            # convert for tkinter
+            img = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(img)
+            img = img.resize((800, 450))
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.canvas.imgtk = imgtk
+            self.canvas.create_image(0,0, anchor=tk.NW, image=imgtk)
+
+            time.sleep(0.03)
+
+        self.stop()
+
+    def log(self, msg: str):
+        self.textbox.insert(tk.END, msg + '\n')
+        self.textbox.see(tk.END)
+
+# if run as script
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = ANPRApp(root)
+    root.mainloop()
+
+# --------------------
+# file: requirements.txt
+# --------------------
+"""
+opencv-python
+numpy
+imutils
+scikit-image
+tensorflow==2.6.0  # only if you need the old TF model loader; optional for EasyOCR
+easyocr
+pillow
+"""
+
+# --------------------
+# file: README.md
+# --------------------
+"""
+ANPR (YOLO + EasyOCR) Modular Project
+
+Overview
+--------
+This project provides a modular ANPR pipeline using a YOLO object detector (or a fallback contour-based plate finder) and EasyOCR for recognition. A simple Tkinter GUI lets you preview video, toggle detectors, and see recognized text.
+
+Quick start
+-----------
+1. Create a virtual environment (recommended):
+   python -m venv venv
+   source venv/bin/activate  # linux/mac
+   venv\Scripts\activate     # windows
+
+2. Install requirements:
+   pip install -r requirements.txt
+
+3. Download YOLO model (optional):
+   - Put your yolo .cfg and .weights (or .onnx) into model/ and load via GUI button "Load YOLO Model".
+   - If you don't have a YOLO plate detector, use the fallback contour method (enabled by unchecking "Use YOLO").
+
+4. Run the GUI:
+   python app.py
+
+Notes & Improvements
+--------------------
+- For better accuracy, train a dedicated YOLO model for license plates or use pretrained models specialized for ANPR.
+- EasyOCR supports multiple languages; add languages if plates contain regional scripts.
+- For production, swap Tkinter for a web UI (Flask/FastAPI + JS frontend) and add batching, logging, and rate limits.
+
+"""
+
+# End of document
